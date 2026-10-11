@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.png binary
+# Keep GitHub's language statistics about the Go code.
+legacy/** linguist-vendored
