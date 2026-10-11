@@ -1,2 +1,8 @@
-requests
-tqdm
+# Pinned to a known-good set (resolved 2025-07, Python 3.12). Unpinned
+# installs pulled whatever PyPI had on deploy day.
+requests==2.32.4
+urllib3==2.5.0
+idna==3.10
+certifi==2025.6.15
+charset-normalizer==3.4.2
+tqdm==4.67.1

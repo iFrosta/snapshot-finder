@@ -78,6 +78,7 @@ DISCARDED_BY_TIMEOUT = 0
 FULL_LOCAL_SNAPSHOTS = []
 # skip servers that do not fit the filters so as not to check them again
 unsuitable_servers = set()
+Path(SNAPSHOT_PATH).mkdir(parents=True, exist_ok=True)
 # Configure Logging
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 if args.verbose:
@@ -168,7 +169,7 @@ def do_request(url_: str, method_: str = 'GET', data_: str = '', timeout_: int =
     except Exception as unknwErr:
         DISCARDED_BY_UNKNW_ERR += 1
         # logger.debug(f'error in do_request(): {unknwErr=}')
-        return f'error in do_request(): {reqErr}'
+        return f'error in do_request(): {unknwErr}'
 
 
 def get_current_slot():
@@ -218,8 +219,8 @@ def get_all_rpc_ips():
         return rpc_ips
 
     else:
-        logger.error(f'Can\'t get RPC ip addresses {r.text}')
-        sys.exit()
+        logger.error(f'Can\'t get RPC ip addresses {r}')
+        return None
 
 
 def get_snapshot_slot(rpc_address: str):
@@ -234,11 +235,11 @@ def get_snapshot_slot(rpc_address: str):
     # d = '{"jsonrpc":"2.0","id":1,"method":"getHighestSnapshotSlot"}'
     try:
         r = do_request(url_=inc_url, method_='head', timeout_=1)
-        if 'location' in str(r.headers) and 'error' not in str(r.text) and r.elapsed.total_seconds() * 1000 > MAX_LATENCY:
+        if 'location' in r.headers and 'error' not in str(r.text) and r.elapsed.total_seconds() * 1000 > MAX_LATENCY:
             DISCARDED_BY_LATENCY += 1
             return None
 
-        if 'location' in str(r.headers) and 'error' not in str(r.text):
+        if 'location' in r.headers and 'error' not in str(r.text):
             snap_location_ = r.headers["location"]
             if snap_location_.endswith('tar') is True:
                 DISCARDED_BY_ARCHIVE_TYPE += 1
@@ -266,7 +267,8 @@ def get_snapshot_slot(rpc_address: str):
                 return
 
             r2 = do_request(url_=url, method_='head', timeout_=1)
-            if 'location' in str(r.headers) and 'error' not in str(r.text):
+            if 'location' in r.headers and 'location' in r2.headers \
+                    and int(r2.headers['location'].split('-')[1]) == incremental_snap_slot:
                 json_data["rpc_nodes"].append({
                     "snapshot_address": rpc_address,
                     "slots_diff": slots_diff,
@@ -276,7 +278,7 @@ def get_snapshot_slot(rpc_address: str):
                 return
 
         r = do_request(url_=url, method_='head', timeout_=1)
-        if 'location' in str(r.headers) and 'error' not in str(r.text):
+        if 'location' in r.headers and 'error' not in str(r.text):
             snap_location_ = r.headers["location"]
             # filtering uncompressed archives
             if snap_location_.endswith('tar') is True:
@@ -334,17 +336,27 @@ def download(url: str):
               stdout=subprocess.PIPE,
               universal_newlines=True)
 
+        if process.returncode != 0:
+            logger.error(f'wget failed with exit code {process.returncode} for {url}')
+            if os.path.exists(temp_fname):
+                os.remove(temp_fname)
+            return False
         logger.info(f'Rename the downloaded file {temp_fname} --> {fname}')
         os.rename(temp_fname, f'{SNAPSHOT_PATH}/{fname}')
+        return True
 
     except Exception as unknwErr:
         logger.error(f'Exception in download() func. Make sure wget is installed\n{unknwErr}')
+        return False
 
 
 def main_worker():
     try:
         global FULL_LOCAL_SNAP_SLOT
-        rpc_nodes = list(set(get_all_rpc_ips()))
+        rpc_ips = get_all_rpc_ips()
+        if rpc_ips is None:
+            return 1
+        rpc_nodes = list(set(rpc_ips))
         global pbar
         pbar = tqdm(total=len(rpc_nodes))
         logger.info(f'RPC servers in total: {len(rpc_nodes)} | Current slot number: {current_slot}\n')
@@ -362,7 +374,12 @@ def main_worker():
 
         print(f'Searching information about snapshots on all found RPCs')
         pool = ThreadPool()
-        pool.map(get_snapshot_slot, rpc_nodes)
+        try:
+            pool.map(get_snapshot_slot, rpc_nodes)
+        finally:
+            pool.close()
+            pool.join()
+            pbar.close()  # an unclosed bar's __del__ segfaults CPython 3.13.16/3.14.0-3.14.5 at exit
         logger.info(f'Found suitable RPCs: {len(json_data["rpc_nodes"])}')
         logger.info(f'The following information shows for what reason and how many RPCs were skipped.'
         f'Timeout most probably mean, that node RPC port does not respond (port is closed)\n'
@@ -371,7 +388,7 @@ def main_worker():
 
         if len(json_data["rpc_nodes"]) == 0:
             logger.info(f'No snapshot nodes were found matching the given parameters: {args.max_snapshot_age=}')
-            sys.exit()
+            return 1
 
         # sort list of rpc node by SORT_ORDER (latency)
         rpc_nodes_sorted = sorted(json_data["rpc_nodes"], key=lambda k: k[SORT_ORDER])
@@ -405,7 +422,16 @@ def main_worker():
                 logger.info(f'Rpc node already in unsuitable list --> skip {rpc_node["snapshot_address"]}')
                 continue
 
-            down_speed_bytes = measure_speed(url=rpc_node["snapshot_address"], measure_time=SPEED_MEASURE_TIME_SEC)
+            if i > num_of_rpc_to_check:
+                logger.info(f'The limit on the number of RPC nodes from'
+                f' which we measure the speed has been reached {num_of_rpc_to_check=}')
+                break
+            try:
+                down_speed_bytes = measure_speed(url=rpc_node["snapshot_address"], measure_time=SPEED_MEASURE_TIME_SEC)
+            except Exception as speedErr:
+                logger.info(f'Speed test failed for {rpc_node["snapshot_address"]}: {speedErr}')
+                unsuitable_servers.add(rpc_node["snapshot_address"])
+                continue
             down_speed_mb = convert_size(down_speed_bytes)
             if down_speed_bytes < MIN_DOWNLOAD_SPEED_MB * 1e6:
                 logger.info(f'Too slow: {rpc_node=} {down_speed_mb=}')
@@ -424,7 +450,7 @@ def main_worker():
 
                     if 'incremental' in path:
                         r = do_request(f'http://{rpc_node["snapshot_address"]}/incremental-snapshot.tar.bz2', method_='head', timeout_=2)
-                        if 'location' in str(r.headers) and 'error' not in str(r.text):
+                        if 'location' in r.headers and 'error' not in str(r.text):
                             best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{r.headers["location"]}'
                         else:
                             best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{path}'
@@ -432,7 +458,9 @@ def main_worker():
                     else:
                         best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{path}'
                     logger.info(f'Downloading {best_snapshot_node} snapshot to {SNAPSHOT_PATH}')
-                    download(url=best_snapshot_node)
+                    if not download(url=best_snapshot_node):
+                        unsuitable_servers.add(rpc_node["snapshot_address"])
+                        return 1
                 return 0
 
             elif i > num_of_rpc_to_check:
@@ -454,11 +482,14 @@ def main_worker():
     except KeyboardInterrupt:
         sys.exit('\nKeyboardInterrupt - ctrl + c')
 
-    except:
+    except Exception as workerErr:
+        logger.error(f'main_worker() failed: {workerErr!r}')
         return 1
 
+    return 1  # no node met --min_download_speed
 
-logger.info("Version: 0.3.9")
+
+logger.info("Version: 0.3.9-legacy-fix1")
 logger.info("https://github.com/c29r3/solana-snapshot-finder\n\n")
 logger.info(f'{RPC=}\n'
       f'{MAX_SNAPSHOT_AGE_IN_SLOTS=}\n'
@@ -476,13 +507,13 @@ try:
     os.remove(f'{SNAPSHOT_PATH}/write_perm_test')
 except IOError:
     logger.error(f'\nCheck {SNAPSHOT_PATH=} and permissions')
-    Path(SNAPSHOT_PATH).mkdir(parents=True, exist_ok=True)
+    sys.exit(1)
 
 wget_path = shutil.which("wget")
 
 if wget_path is None:
     logger.error("The wget utility was not found in the system, it is required")
-    sys.exit()
+    sys.exit(1)
 
 json_data = ({"last_update_at": 0.0,
               "last_update_slot": 0,
@@ -508,15 +539,17 @@ while NUM_OF_ATTEMPTS <= NUM_OF_MAX_ATTEMPTS:
 
     if worker_result == 0:
         logger.info("Done")
-        exit(0)
+        sys.exit(0)
 
     if worker_result != 0:
         logger.info("Now trying with flag --with_private_rpc")
         WITH_PRIVATE_RPC = True
 
-    if NUM_OF_ATTEMPTS >= NUM_OF_MAX_ATTEMPTS:
-        logger.error(f'Could not find a suitable snapshot --> exit')
-        sys.exit()
+    if NUM_OF_ATTEMPTS > NUM_OF_MAX_ATTEMPTS:
+        break
 
     logger.info(f"Sleeping {SLEEP_BEFORE_RETRY} seconds before next try")
     time.sleep(SLEEP_BEFORE_RETRY)
+
+logger.error(f'Could not find a suitable snapshot --> exit')
+sys.exit(1)
