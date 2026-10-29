@@ -51,6 +51,8 @@ snapshot-finder --snapshot_path /ledger/remote -r https://api.mainnet-beta.solan
   free-space check before writing.
 - **Speed gate that is the download itself.** The first seconds of the real
   transfer are measured; slow nodes are abandoned and the next candidate is tried.
+  The incremental has its own gate (`--min_incremental_speed`), enforced over
+  the whole transfer.
 - **Resilience:**
   - stall watchdog;
   - switches node when one slows down mid-transfer;
@@ -66,7 +68,7 @@ snapshot-finder --snapshot_path /ledger/remote -r https://api.mainnet-beta.solan
 ### From GitHub Releases (recommended)
 
 ```sh
-VERSION=v1.0.0
+VERSION=v1.1.0
 ARCH=amd64   # or arm64
 BASE=https://github.com/iFrosta/snapshot-finder/releases/download/$VERSION
 
@@ -160,6 +162,7 @@ Flags take one or two dashes, and `--flag value` and `--flag=value` both work.
 | `--max_speed_tests` | `15` | speed-test at most N nodes per attempt (`0` = all) |
 | `--stall_timeout` | `60` | abandon a node that sends nothing for N seconds |
 | `--no_slowdown_switch` | off | keep a node that slows down mid-download |
+| `--min_incremental_speed` | `20` | MB/s an incremental source must keep over every `--measurement_time` window, from start to end; capped at `--min_download_speed` and `--max_download_speed`; `0` = off |
 | `--reserve_gb` | `5` | free space that must remain after the full snapshot |
 | `--ignore_local` | off | never reuse a full snapshot already in `--snapshot_path` |
 | `--probe_timeout` | `1.5` | seconds per probe request |
@@ -194,9 +197,15 @@ Flags take one or two dashes, and `--flag value` and `--flag=value` both work.
      than starting over at `--min_download_speed`;
    - broken connections are retried on the same node.
 5. **Download the incremental snapshot.** The full download takes minutes, so
-   the nodes are asked again afterwards. The newest incremental for that full
-   slot is fetched from the same node when it is as fresh as any, otherwise
-   from another node serving the agreed full.
+   the nodes are asked again afterwards. Sources serving an incremental for
+   that full slot are ranked: fresh (within `--max_snapshot_age`) first; among
+   those, the node the full came from first (it just proved fast); then the
+   other nodes serving the agreed full by `--sort_order`. Each source must keep
+   `--min_incremental_speed` over every `--measurement_time` window, and a
+   watchdog checks this beside the transfer, so a node that trickles bytes or
+   goes silent is abandoned within seconds. Its partial file is deleted and the
+   next source is tried. If no source works and the full snapshot alone is
+   within `--max_snapshot_age`, the run ends with the full snapshot only.
 6. **Reuse.** If a complete full snapshot is already in the directory and the
    network still has a fresh incremental for it, only the incremental is fetched.
 

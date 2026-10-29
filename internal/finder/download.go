@@ -17,7 +17,7 @@ import (
 // Download errors. Only errShortBody and transport errors are retried on the
 // same node; the others make the caller move on to another node (or give up).
 var (
-	ErrTooSlow   = errors.New("download speed below --min_download_speed")
+	ErrTooSlow   = errors.New("download speed below the minimum")
 	ErrGone      = errors.New("archive is no longer served by the node")
 	ErrNoSpace   = errors.New("not enough free disk space")
 	ErrStalled   = errors.New("download stalled")
@@ -33,6 +33,7 @@ type FetchOptions struct {
 	MaxSpeed         float64       // bytes/s; 0 = unlimited
 	StallTimeout     time.Duration // abort when no byte arrives for this long
 	SwitchOnSlowdown bool          // see ErrSlowdown
+	SustainMinSpeed  bool          // keep checking MinSpeed after the gate, over every following window of MeasureTime
 	SlowdownWindow   time.Duration
 	DryRun           bool // measure the speed only, write nothing
 	ProgressEvery    time.Duration
@@ -303,34 +304,63 @@ func (d *Downloader) fetchOnce(ctx context.Context, addr string, a Archive, tmp,
 		dst = f
 	}
 
-	// Stall watchdog: cancel the request when no byte arrived for StallTimeout.
-	var lastByte atomic.Int64
-	lastByte.Store(time.Now().UnixNano())
+	gate := o.MinSpeed > 0 || o.DryRun
+	warmup := time.Duration(0)
+	if o.MeasureTime > 2*time.Second {
+		warmup = time.Second // skip TCP slow start
+	}
+	start := time.Now()
+
+	// Watchdog: cancel the request when no byte arrived for StallTimeout, or
+	// (SustainMinSpeed) when a window of MeasureTime-warmup after the warm-up
+	// averaged less than MinSpeed. It runs beside the read loop so that a
+	// node trickling bytes, or a read blocked for good, is caught on time:
+	// the gate in the loop below only runs when a read returns.
+	var lastByte, gotBytes atomic.Int64
+	lastByte.Store(start.UnixNano())
 	done := make(chan struct{})
 	defer close(done)
-	if o.StallTimeout > 0 {
+	sustain := o.SustainMinSpeed && o.MinSpeed > 0 && o.MeasureTime > warmup
+	if o.StallTimeout > 0 || sustain {
+		tick := time.Second
+		if sustain {
+			tick = min(tick, max((o.MeasureTime-warmup)/4, 10*time.Millisecond))
+		}
 		go func() {
-			t := time.NewTicker(time.Second)
+			t := time.NewTicker(tick)
 			defer t.Stop()
+			winStart, winBytes, inWarmup := start, int64(0), true
 			for {
 				select {
 				case <-done:
 					return
 				case now := <-t.C:
-					if now.Sub(time.Unix(0, lastByte.Load())) > o.StallTimeout {
+					if o.StallTimeout > 0 && now.Sub(time.Unix(0, lastByte.Load())) > o.StallTimeout {
 						cancel(ErrStalled)
 						return
+					}
+					if !sustain {
+						continue
+					}
+					if inWarmup {
+						if now.Sub(start) >= warmup {
+							winStart, winBytes, inWarmup = now, gotBytes.Load(), false
+						}
+						continue
+					}
+					if el := now.Sub(winStart); el >= o.MeasureTime-warmup {
+						n := gotBytes.Load()
+						if speed := float64(n-winBytes) / el.Seconds(); speed < o.MinSpeed {
+							cancel(fmt.Errorf("%w: %.1f MB/s over the last %s < %.1f MB/s", ErrTooSlow, speed/1e6, el.Round(100*time.Millisecond), o.MinSpeed/1e6))
+							return
+						}
+						winStart, winBytes = now, n
 					}
 				}
 			}
 		}()
 	}
 
-	gate := o.MinSpeed > 0 || o.DryRun
-	warmup := time.Duration(0)
-	if o.MeasureTime > 2*time.Second {
-		warmup = time.Second // skip TCP slow start
-	}
 	window := o.SlowdownWindow
 	if window <= 0 {
 		window = 30 * time.Second
@@ -338,7 +368,6 @@ func (d *Downloader) fetchOnce(ctx context.Context, addr string, a Archive, tmp,
 	buf := make([]byte, 4<<20)
 	var got, warmBytes, winBytes int64
 	warmTaken := warmup == 0
-	start := time.Now()
 	winStart := start
 	nextLog := start.Add(o.ProgressEvery)
 	for {
@@ -349,11 +378,14 @@ func (d *Downloader) fetchOnce(ctx context.Context, addr string, a Archive, tmp,
 			}
 			got += int64(n)
 			res.Transferred += int64(n)
+			gotBytes.Store(got)
 			lastByte.Store(time.Now().UnixNano())
 		}
 		if rerr != nil && rerr != io.EOF {
 			if cause := context.Cause(reqCtx); errors.Is(cause, ErrStalled) {
 				return fmt.Errorf("%w: no data for %s", ErrStalled, o.StallTimeout)
+			} else if errors.Is(cause, ErrTooSlow) {
+				return cause
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()

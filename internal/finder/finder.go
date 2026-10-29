@@ -65,6 +65,7 @@ type Config struct {
 	WildcardVersion  string
 	MaxAge           uint64
 	MinSpeedMB       float64
+	MinIncSpeedMB    float64 // incremental downloads; capped at MinSpeedMB and MaxSpeedMB, 0 = no gate
 	MaxSpeedMB       float64
 	MaxLatency       time.Duration
 	WithPrivateRPC   bool
@@ -90,6 +91,7 @@ type Config struct {
 
 // SpeedTest records one node's speed gate result.
 type SpeedTest struct {
+	Kind   string  `json:"kind,omitempty"` // "incremental"; empty for the full snapshot
 	Addr   string  `json:"addr"`
 	MBps   float64 `json:"mb_per_s"`
 	Result string  `json:"result"`
@@ -290,8 +292,8 @@ func (r *runner) tryLocalFull(ctx context.Context, results []ProbeResult, opts S
 		return true, nil
 	}
 	var fresh []IncSource
-	for _, s := range IncrementalSources(results, lf, opts) {
-		if r.cfg.Slot != 0 || int64(r.currentSlot)-int64(s.Inc.Slot) <= int64(r.cfg.MaxAge) {
+	for _, s := range rankIncrementalSources(IncrementalSources(results, lf, opts), "", opts, r.bad) {
+		if incFresh(s.Inc, opts) {
 			fresh = append(fresh, s)
 		}
 	}
@@ -306,7 +308,7 @@ func (r *runner) tryLocalFull(ctx context.Context, results []ProbeResult, opts S
 		r.log.Infof("Dry run: would download %s from %s", fresh[0].Inc.Name, fresh[0].Addr)
 		return true, nil
 	}
-	if err := r.fetchIncremental(ctx, lf, fresh); err != nil {
+	if err := r.fetchIncremental(ctx, lf, fresh, ""); err != nil {
 		if CodeOf(err) == ExitLocal || ctx.Err() != nil {
 			return true, err
 		}
@@ -328,6 +330,31 @@ func (r *runner) fetchOptions(gate bool) FetchOptions {
 		o.SwitchOnSlowdown = r.cfg.SwitchOnSlowdown
 		o.ReserveBytes = r.cfg.ReserveBytes
 	}
+	return o
+}
+
+// minIncSpeedMB is the speed an incremental source must keep. It never asks
+// more of a node than the full snapshot download did.
+func (r *runner) minIncSpeedMB() float64 {
+	s := r.cfg.MinIncSpeedMB
+	if r.cfg.MinSpeedMB > 0 {
+		s = min(s, r.cfg.MinSpeedMB)
+	}
+	if r.cfg.MaxSpeedMB > 0 {
+		s = min(s, r.cfg.MaxSpeedMB)
+	}
+	return s
+}
+
+// incFetchOptions: the incremental gets a speed gate too, enforced over the
+// whole transfer, not only its first seconds. Without it a node trickling
+// bytes never tripped the stall watchdog and the run sat for an hour on a
+// 0.3 GB file (mainnet, 2026-10-19 and 2026-10-29).
+func (r *runner) incFetchOptions() FetchOptions {
+	o := r.fetchOptions(false)
+	o.MinSpeed = r.minIncSpeedMB() * 1e6
+	o.MeasureTime = r.cfg.MeasureTime
+	o.SustainMinSpeed = true
 	return o
 }
 
@@ -401,7 +428,7 @@ func (r *runner) downloadFromCandidates(ctx context.Context, results []ProbeResu
 		if r.cfg.Slot != 0 && full.Slot == r.cfg.Slot {
 			return nil
 		}
-		return r.fetchIncremental(ctx, full, r.reprobeIncrementals(ctx, full, c.Addr, results))
+		return r.fetchIncremental(ctx, full, r.reprobeIncrementals(ctx, full, c.Addr, results), c.Addr)
 	}
 	if tested == 0 {
 		return &ExitError{ExitNoSnapshot, errAllKnownBad}
@@ -414,7 +441,7 @@ func (r *runner) downloadFromCandidates(ctx context.Context, results []ProbeResu
 
 // reprobeIncrementals asks the nodes again for their incremental snapshot:
 // the full download takes minutes and the incrementals seen during discovery
-// are stale (or deleted) by then. The node we got the full from goes first.
+// are stale (or deleted) by then. The result is ranked by rankIncrementalSources.
 func (r *runner) reprobeIncrementals(ctx context.Context, full Archive, preferred string, results []ProbeResult) []IncSource {
 	addrs := []string{preferred}
 	type cand struct {
@@ -448,40 +475,103 @@ func (r *runner) reprobeIncrementals(ctx context.Context, full Archive, preferre
 	if slot, err := r.rpc.GetSlot(ctx); err == nil && r.cfg.Slot == 0 {
 		r.currentSlot = slot
 	}
-	srcs := IncrementalSources(fresh, full, r.selectOptions())
-	// Prefer the node we already have a fast connection to when it is as fresh as any.
-	sort.SliceStable(srcs, func(i, j int) bool {
-		if srcs[i].Inc.Slot != srcs[j].Inc.Slot {
-			return srcs[i].Inc.Slot > srcs[j].Inc.Slot
-		}
-		return srcs[i].Addr == preferred && srcs[j].Addr != preferred
-	})
-	return srcs
+	return rankIncrementalSources(IncrementalSources(fresh, full, r.selectOptions()), preferred, r.selectOptions(), r.bad)
 }
 
-func (r *runner) fetchIncremental(ctx context.Context, full Archive, srcs []IncSource) error {
+// incFresh: the incremental is within --max_snapshot_age (or is the one
+// asked for with --slot).
+func incFresh(inc Archive, o SelectOptions) bool {
+	return o.SpecificSlot != 0 || int64(o.CurrentSlot)-int64(inc.Slot) <= int64(o.MaxAge)
+}
+
+// rankIncrementalSources orders the sources of an incremental snapshot:
+//  1. fresh (within --max_snapshot_age) before stale;
+//  2. the node the full snapshot came from (preferred) first: it just proved
+//     fast, while the newest incremental elsewhere may sit on a slow node —
+//     a few hundred slots of freshness are not worth an hour of download;
+//  3. nodes that already failed in this run last;
+//  4. then --sort_order, as for full snapshots: latency (default), or the
+//     newest incremental first (slots_diff); stale ones always newest first.
+//
+// The speed gate in the download then skips a slow node within seconds.
+func rankIncrementalSources(srcs []IncSource, preferred string, o SelectOptions, bad map[string]string) []IncSource {
+	out := append([]IncSource(nil), srcs...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if fa, fb := incFresh(a.Inc, o), incFresh(b.Inc, o); fa != fb {
+			return fa
+		}
+		if pa, pb := a.Addr == preferred, b.Addr == preferred; pa != pb {
+			return pa
+		}
+		_, ba := bad[a.Addr]
+		_, bb := bad[b.Addr]
+		if ba != bb {
+			return bb
+		}
+		if (o.SortOrder == "slots_diff" || !incFresh(a.Inc, o)) && a.Inc.Slot != b.Inc.Slot {
+			return a.Inc.Slot > b.Inc.Slot
+		}
+		if a.Latency != b.Latency {
+			return a.Latency < b.Latency
+		}
+		return a.Inc.Slot > b.Inc.Slot
+	})
+	return out
+}
+
+// fetchIncremental downloads the incremental for full from the ranked
+// sources, one after another; a source below --min_incremental_speed (or
+// failing otherwise) is abandoned and its partial file deleted. When none
+// works and the full snapshot alone is fresh enough, that is accepted.
+func (r *runner) fetchIncremental(ctx context.Context, full Archive, srcs []IncSource, preferred string) error {
+	age := int64(r.currentSlot) - int64(full.Slot)
+	fullFresh := age <= int64(r.cfg.MaxAge)
 	if len(srcs) == 0 {
-		age := int64(r.currentSlot) - int64(full.Slot)
-		if age <= int64(r.cfg.MaxAge) {
+		if fullFresh {
 			r.log.Infof("No incremental snapshot based on slot %d, but the full snapshot is fresh enough (%d slots old)", full.Slot, age)
 			return nil
 		}
 		return &ExitError{ExitDownload, fmt.Errorf("no node serves an incremental snapshot based on full slot %d (the full snapshot is kept; the next run only fetches the incremental)", full.Slot)}
 	}
+	limit := len(srcs)
+	if r.cfg.MaxSpeedTests > 0 {
+		limit = min(limit, r.cfg.MaxSpeedTests)
+	}
+	opts, minSpeed := r.incFetchOptions(), r.minIncSpeedMB()
+	r.log.Infof("Incremental for full slot %d: %d source(s), trying up to %d, min speed %.0f MB/s", full.Slot, len(srcs), limit, minSpeed)
 	var lastErr error
-	for i, s := range srcs {
-		if i >= 5 {
-			break
+	for i, s := range srcs[:limit] {
+		why := "next by " + r.cfg.SortOrder
+		switch {
+		case preferred != "" && s.Addr == preferred:
+			why = "served the full snapshot"
+		case preferred != "" && i == 0:
+			why = "the full snapshot's node has no fresh incremental for this base; best by " + r.cfg.SortOrder
 		}
-		if age := int64(r.currentSlot) - int64(s.Inc.Slot); r.cfg.Slot == 0 && age > int64(r.cfg.MaxAge) {
-			r.log.Warnf("Newest incremental %s is %d slots old (> --max_snapshot_age %d); using it anyway", s.Inc.Name, age, r.cfg.MaxAge)
+		if !incFresh(s.Inc, r.selectOptions()) {
+			why += fmt.Sprintf("; %d slots old (> --max_snapshot_age %d), using it anyway", int64(r.currentSlot)-int64(s.Inc.Slot), r.cfg.MaxAge)
 		}
-		r.log.Infof("Downloading incremental %s from %s", s.Inc.Name, s.Addr)
-		res, err := r.dl.Fetch(ctx, s.Addr, s.Inc, r.cfg.SnapshotPath, r.fetchOptions(false))
+		r.log.Infof("Downloading incremental %s from %s (source %d/%d: %s; latency %dms)", s.Inc.Name, s.Addr, i+1, len(srcs), why, s.Latency.Milliseconds())
+		inc := s.Inc
+		res, err := r.dl.Fetch(ctx, s.Addr, inc, r.cfg.SnapshotPath, opts)
+		if errors.Is(err, ErrGone) {
+			// Incrementals rotate every few hundred slots; ask the node for its current one.
+			if ni, _, perr := r.prober.ProbeIncremental(ctx, s.Addr); perr == nil && ni.BaseSlot == full.Slot && ni.Slot > inc.Slot && ni.Compressed() && !Blacklisted(*ni, r.cfg.Blacklist) {
+				r.log.Infof("%s now serves %s — trying that", s.Addr, ni.Name)
+				inc = *ni
+				res, err = r.dl.Fetch(ctx, s.Addr, inc, r.cfg.SnapshotPath, opts)
+			}
+		}
+		st := SpeedTest{Kind: "incremental", Addr: s.Addr, MBps: res.MeasuredMBps, Result: "ok"}
+		if err != nil {
+			st.Result = err.Error()
+		}
+		r.sum.SpeedTests = append(r.sum.SpeedTests, st)
 		if err == nil {
 			r.sum.Incremental = &res
 			r.sum.Files = append(r.sum.Files, res.Path)
-			r.log.Infof("Downloaded %s (%s) in %.0fs", s.Inc.Name, HumanBytes(res.Size), res.Seconds)
+			r.log.Infof("Downloaded %s (%s) from %s in %.1fs, avg %.0f MB/s", inc.Name, HumanBytes(res.Size), s.Addr, res.Seconds, res.AvgMBps)
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -490,10 +580,18 @@ func (r *runner) fetchIncremental(ctx context.Context, full Archive, srcs []IncS
 		if errors.Is(err, ErrNoSpace) {
 			return &ExitError{ExitLocal, err}
 		}
-		r.log.Warnf("%s: %s failed: %v", s.Addr, s.Inc.Name, err)
+		if errors.Is(err, ErrTooSlow) || errors.Is(err, ErrStalled) {
+			r.bad[s.Addr] = "incremental too slow"
+		}
+		r.log.Warnf("%s: incremental %s abandoned after %s (%s received): %v — partial file deleted, trying the next source",
+			s.Addr, inc.Name, time.Duration(res.Seconds*float64(time.Second)).Round(100*time.Millisecond), HumanBytes(res.Transferred), err)
 		lastErr = err
 	}
-	return &ExitError{ExitDownload, fmt.Errorf("incremental snapshot for full slot %d could not be downloaded (the full snapshot is kept): %w", full.Slot, lastErr)}
+	if fullFresh && r.cfg.Slot == 0 {
+		r.log.Warnf("No incremental source worked (last error: %v), but the full snapshot is fresh enough (%d slots old) — using it alone", lastErr, age)
+		return nil
+	}
+	return &ExitError{ExitDownload, fmt.Errorf("incremental snapshot for full slot %d could not be downloaded from %d source(s) (the full snapshot is kept): %w", full.Slot, limit, lastErr)}
 }
 
 // writeCandidates writes snapshot.json in upstream's format.

@@ -243,6 +243,117 @@ func TestIncrementalRefreshedAfterFullDownload(t *testing.T) {
 	}
 }
 
+// Mainnet 2026-10-19 and 2026-10-29: the full came at ~250 MB/s, then the
+// incremental was fetched from another node that had a newer one, at ~0 MB/s
+// with an ETA of an hour. The node the full came from goes first.
+func TestIncrementalPrefersFullSnapshotNode(t *testing.T) {
+	c := fc.New(slot,
+		fc.NodeSpec{FullSlot: slot - 5000, IncSlot: slot - 120},                                                // fast; the full comes from here
+		fc.NodeSpec{FullSlot: slot - 5000, IncSlot: slot - 20, RateBps: 1e6, HeadDelay: 30 * time.Millisecond}, // newer incremental, trickling
+	)
+	defer c.Close()
+	dir := t.TempDir()
+	cfg := config(c, dir)
+	cfg.MinIncSpeedMB = 5
+	sum, err, log := run(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	if sum.Full.Addr != n0.Addr || sum.Incremental.Addr != n0.Addr || sum.Incremental.Archive.Slot != slot-120 {
+		t.Fatalf("full from %s, incremental %s from %s", sum.Full.Addr, sum.Incremental.Archive.Name, sum.Incremental.Addr)
+	}
+	mustVerify(t, dir, n0.IncName(), 1<<20)
+	if n1.GetCount(n1.IncName()) != 0 || !strings.Contains(log, "served the full snapshot") {
+		t.Fatalf("slow node asked for its incremental %d time(s); log:\n%s", n1.GetCount(n1.IncName()), log)
+	}
+}
+
+func TestSlowIncrementalSourceAbandoned(t *testing.T) {
+	c := fc.New(slot,
+		fc.NodeSpec{FullSlot: slot - 5000}, // fast, serves no incremental
+		fc.NodeSpec{FullSlot: slot - 5000, IncSlot: slot - 20, RateBps: 1e6, HeadDelay: 20 * time.Millisecond}, // lowest latency of the rest, ~1 MB/s
+		fc.NodeSpec{FullSlot: slot - 5000, IncSlot: slot - 20, HeadDelay: 40 * time.Millisecond},
+	)
+	defer c.Close()
+	dir := t.TempDir()
+	cfg := config(c, dir)
+	cfg.MinIncSpeedMB = 5
+	sum, err, log := run(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n1, n2 := c.Nodes[1], c.Nodes[2]
+	if sum.Full.Addr != c.Nodes[0].Addr || sum.Incremental.Addr != n2.Addr {
+		t.Fatalf("full from %s, incremental from %s, want %s", sum.Full.Addr, sum.Incremental.Addr, n2.Addr)
+	}
+	mustVerify(t, dir, n2.IncName(), 1<<20)
+	if n1.GetCount(n1.IncName()) != 1 || !strings.Contains(log, "abandoned") {
+		t.Fatalf("slow source tried %d time(s); log:\n%s", n1.GetCount(n1.IncName()), log)
+	}
+	if got := files(t, dir); len(got) != 2 {
+		t.Fatalf("files %v (partial incremental of the slow node left behind?)", got)
+	}
+	var incTests int
+	for _, st := range sum.SpeedTests {
+		if st.Kind == "incremental" {
+			incTests++
+			if st.Addr == n1.Addr && !strings.Contains(st.Result, "below the minimum") {
+				t.Errorf("speed test of the slow source: %+v", st)
+			}
+		}
+	}
+	if incTests != 2 {
+		t.Errorf("incremental speed tests %+v", sum.SpeedTests)
+	}
+}
+
+// A node that is fast at first and then sends nothing: the read blocks, so
+// only the watchdog can end it, long before --stall_timeout.
+func TestIncrementalSlowdownMidTransferAborts(t *testing.T) {
+	c := fc.New(slot, fc.NodeSpec{FullSlot: slot - 5000, IncSlot: slot - 20, IncSize: 32 << 20, StallAfter: 4 << 20})
+	defer c.Close()
+	n := c.Nodes[0]
+	a, err := finder.ParseArchiveName(n.IncName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	dl := finder.NewDownloader(finder.NewLogger(&bytes.Buffer{}, false))
+	t0 := time.Now()
+	_, err = dl.Fetch(context.Background(), n.Addr, a, dir, finder.FetchOptions{
+		MinSpeed: 5e6, MeasureTime: 300 * time.Millisecond, SustainMinSpeed: true, StallTimeout: 30 * time.Second, MaxAttempts: 3,
+	})
+	if !errors.Is(err, finder.ErrTooSlow) || time.Since(t0) > 5*time.Second {
+		t.Fatalf("err %v after %s, want ErrTooSlow within a few windows", err, time.Since(t0))
+	}
+	if got := files(t, dir); len(got) != 0 {
+		t.Fatalf("left %v behind", got)
+	}
+}
+
+func TestAllIncrementalSourcesSlowFallsBackToFreshFull(t *testing.T) {
+	c := fc.New(slot,
+		fc.NodeSpec{FullSlot: slot - 500}, // fresh enough on its own (max age 1300)
+		fc.NodeSpec{FullSlot: slot - 500, IncSlot: slot - 20, RateBps: 1e6, HeadDelay: 20 * time.Millisecond},
+	)
+	defer c.Close()
+	dir := t.TempDir()
+	cfg := config(c, dir)
+	cfg.MinIncSpeedMB = 5
+	sum, err, log := run(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := c.Nodes[0].FullName()
+	if got := files(t, dir); len(got) != 1 || got[0] != full || sum.Incremental != nil {
+		t.Fatalf("files %v, incremental %+v", got, sum.Incremental)
+	}
+	if !strings.Contains(log, "fresh enough") {
+		t.Fatalf("log:\n%s", log)
+	}
+}
+
 func TestFullRotatedBetweenProbeAndDownload(t *testing.T) {
 	c := fc.New(slot, fc.NodeSpec{FullSlot: slot - 5000, IncSlot: slot - 20})
 	defer c.Close()

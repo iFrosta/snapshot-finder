@@ -51,6 +51,7 @@ type options struct {
 	wildcardVersion  string
 	maxAge           uint64
 	minSpeed         float64
+	minIncSpeed      float64
 	maxSpeed         float64
 	maxLatency       int
 	withPrivateRPC   bool
@@ -141,6 +142,7 @@ func newFlagSet(o *options, stderr io.Writer) *flag.FlagSet {
 	floatVar(&o.stallTimeout, 60, "abort a download that received nothing for this many seconds", alias("stall_timeout"))
 	intVar(&o.minAgreement, 1, "require at least this many nodes serving the identical full snapshot (slot+hash)", alias("min_agreement"))
 	boolVar(&o.noSlowdownSwitch, "never abandon a node that slows down mid-download", alias("no_slowdown_switch"))
+	floatVar(&o.minIncSpeed, 20, "minimum incremental download speed in MB/s, enforced over every --measurement_time window; capped at --min_download_speed (0 = off)", alias("min_incremental_speed"))
 	floatVar(&o.reserveGB, 5, "GB of free space to keep after the full snapshot (for the incremental)", alias("reserve_gb"))
 	floatVar(&o.progressInterval, 10, "seconds between progress lines", alias("progress_interval"))
 	boolVar(&o.ignoreLocal, "do not reuse a complete full snapshot already in --snapshot_path", alias("ignore_local"))
@@ -179,7 +181,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if o.sortOrder != "latency" && o.sortOrder != "slots_diff" {
 		return usage("--sort_order must be latency or slots_diff, got %q", o.sortOrder)
 	}
-	if o.minSpeed < 0 || o.maxSpeed < 0 || o.measureTime < 0 || o.threads < 1 || o.probeTimeout <= 0 {
+	if o.minSpeed < 0 || o.minIncSpeed < 0 || o.maxSpeed < 0 || o.measureTime < 0 || o.threads < 1 || o.probeTimeout <= 0 {
 		return usage("negative speed/time or zero --threads-count/--probe_timeout")
 	}
 	if o.maxSpeed > 0 && o.maxSpeed < o.minSpeed {
@@ -243,7 +245,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	cfg := finder.Config{
 		RPC: o.rpc, Threads: o.threads, Slot: o.slot, Version: o.nodeVersion, WildcardVersion: o.wildcardVersion,
-		MaxAge: o.maxAge, MinSpeedMB: o.minSpeed, MaxSpeedMB: o.maxSpeed,
+		MaxAge: o.maxAge, MinSpeedMB: o.minSpeed, MinIncSpeedMB: o.minIncSpeed, MaxSpeedMB: o.maxSpeed,
 		MaxLatency: time.Duration(o.maxLatency) * time.Millisecond, WithPrivateRPC: o.withPrivateRPC,
 		MeasureTime: dur(o.measureTime), SnapshotPath: path, Retries: o.retries, Sleep: dur(o.sleep),
 		SortOrder: o.sortOrder, IPBlacklist: ipBlacklist, Blacklist: archiveBlacklist, DryRun: o.dryRun,
@@ -251,8 +253,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		StallTimeout: dur(o.stallTimeout), MinAgreement: o.minAgreement, SwitchOnSlowdown: !o.noSlowdownSwitch,
 		ProgressEvery: dur(o.progressInterval), ReserveBytes: uint64(o.reserveGB * 1e9), WriteCandidates: true, IgnoreLocal: o.ignoreLocal,
 	}
-	log.Infof("snapshot-finder %s | rpc=%s path=%s min_speed=%.0fMB/s max_speed=%.0fMB/s max_age=%d max_latency=%dms private_rpc=%v sort=%s dry_run=%v",
-		version, cfg.RPC, cfg.SnapshotPath, cfg.MinSpeedMB, cfg.MaxSpeedMB, cfg.MaxAge, o.maxLatency, cfg.WithPrivateRPC, cfg.SortOrder, cfg.DryRun)
+	log.Infof("snapshot-finder %s | rpc=%s path=%s min_speed=%.0fMB/s min_inc_speed=%.0fMB/s max_speed=%.0fMB/s max_age=%d max_latency=%dms private_rpc=%v sort=%s dry_run=%v",
+		version, cfg.RPC, cfg.SnapshotPath, cfg.MinSpeedMB, cfg.MinIncSpeedMB, cfg.MaxSpeedMB, cfg.MaxAge, o.maxLatency, cfg.WithPrivateRPC, cfg.SortOrder, cfg.DryRun)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -81,6 +81,9 @@ func TestExitCodes(t *testing.T) {
 	if code, _, _ := runCLI(t, "--sort_order", "random"); code != finder.ExitUsage {
 		t.Errorf("bad sort order: %d", code)
 	}
+	if code, _, _ := runCLI(t, "--min_incremental_speed", "-1"); code != finder.ExitUsage {
+		t.Errorf("negative incremental speed: %d", code)
+	}
 	if code, out, _ := runCLI(t, "-V"); code != 0 || !strings.Contains(out, "snapshot-finder") {
 		t.Errorf("-V: %d %q", code, out)
 	}

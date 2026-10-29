@@ -1,6 +1,7 @@
 package finder
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -238,6 +239,48 @@ func TestIncrementalSources(t *testing.T) {
 	srcs := IncrementalSources(results, f, SelectOptions{CurrentSlot: 1400})
 	if len(srcs) != 3 || srcs[0].Addr != "c:1" || srcs[1].Addr != "b:1" || srcs[2].Inc.Slot != 1200 {
 		t.Fatalf("sources: %+v", srcs)
+	}
+}
+
+func TestRankIncrementalSources(t *testing.T) {
+	ms := time.Millisecond
+	src := func(addr string, slot uint64, lat time.Duration) IncSource {
+		a, err := ParseArchiveName(inc(100, slot, h2))
+		if err != nil {
+			panic(err)
+		}
+		return IncSource{Addr: addr, Inc: a, Latency: lat}
+	}
+	srcs := []IncSource{
+		src("newest-far:1", 1300, 50*ms), // the mainnet case: freshest incremental, slow node
+		src("near:1", 1200, 5*ms),
+		src("full:1", 1200, 20*ms), // the full snapshot came from here
+		src("bad:1", 1300, 1*ms),   // failed earlier in this run
+		src("stale:1", 300, 1*ms),  // older than --max_snapshot_age
+	}
+	bad := map[string]string{"bad:1": "too slow"}
+	order := func(o SelectOptions) string {
+		var out []string
+		for _, s := range rankIncrementalSources(srcs, "full:1", o, bad) {
+			out = append(out, s.Addr)
+		}
+		return strings.Join(out, " ")
+	}
+	o := SelectOptions{CurrentSlot: 1400, MaxAge: 1000, SortOrder: "latency"}
+	if got, want := order(o), "full:1 near:1 newest-far:1 bad:1 stale:1"; got != want {
+		t.Errorf("latency:\n got %s\nwant %s", got, want)
+	}
+	o.SortOrder = "slots_diff"
+	if got, want := order(o), "full:1 newest-far:1 near:1 bad:1 stale:1"; got != want {
+		t.Errorf("slots_diff:\n got %s\nwant %s", got, want)
+	}
+	// The full snapshot's node only goes first while its incremental is fresh.
+	o = SelectOptions{CurrentSlot: 2250, MaxAge: 1000, SortOrder: "latency"}
+	if got, want := order(o), "newest-far:1 bad:1 full:1 near:1 stale:1"; got != want {
+		t.Errorf("stale preferred:\n got %s\nwant %s", got, want)
+	}
+	if srcs[0].Addr != "newest-far:1" {
+		t.Error("input slice reordered")
 	}
 }
 
